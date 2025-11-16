@@ -174,3 +174,50 @@ class SwiGLU(nn.Module):
     def _silu(x: Tensor) -> Tensor:
         """SiLU activation: x * sigmoid(x)"""
         return x * torch.sigmoid(x)
+    
+class MultiHeadSelfAttention(nn.Module):
+    """Multi-head self-attention with optional RoPE."""
+    
+    def __init__(self, d_model: int, num_heads: int, rope=None, device=None, dtype=None):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.rope = rope
+        
+        # Projections
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.o_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+    
+    def forward(self, x: Tensor, token_positions: Tensor = None) -> Tensor:
+        batch_size, seq_len, d_model = x.shape
+        
+        # Project and reshape for multi-head attention
+        # (batch, seq_len, d_model) -> (batch, seq_len, num_heads, d_k) -> (batch, num_heads, seq_len, d_k)
+        Q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        K = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        V = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        
+        # Apply RoPE if provided
+        if self.rope is not None:
+            if token_positions is None:
+                token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+            Q = self.rope(Q, token_positions.unsqueeze(1))  # Broadcast over heads
+            K = self.rope(K, token_positions.unsqueeze(1))
+        
+        # Create causal mask
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
+        causal_mask = ~causal_mask  # Flip: True = attend, False = mask
+        
+        # Attention
+        attn_output = scaled_dot_product_attention(Q, K, V, mask=causal_mask)
+        
+        # Reshape back: (batch, num_heads, seq_len, d_k) -> (batch, seq_len, d_model)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
+        
+        # Output projection
+        return self.o_proj(attn_output)
